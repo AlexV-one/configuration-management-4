@@ -1,0 +1,163 @@
+import argparse
+import xml.etree.ElementTree as ET
+
+# Глобальные переменные для хранения данных
+result_data = []
+log_file_data = []
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="Assembler and Interpreter for UVM")
+    parser.add_argument("mode", choices=["assemble", "interpret"], help="Operation mode: 'assemble' or 'interpret'")
+    parser.add_argument("input_file", help="Input file")
+    parser.add_argument("output_file", help="Output file")
+    parser.add_argument("--log_file", help="Log file (XML format)")
+    parser.add_argument("--result_file", help="Result file for interpreter (XML format)")
+    parser.add_argument("--memory_range", help="Memory range for interpreter (start:end)", type=str)
+    return parser.parse_args()
+
+def read_input_file(input_file):
+    try:
+        with open(input_file, "r", encoding="utf-8") as file:
+            return file.readlines()
+    except FileNotFoundError:
+        print(f"Error! File {input_file} not found")
+        exit(1)
+
+def parse_instruction(instruction):
+    parts = instruction.split()
+    if len(parts) != 2:
+        raise ValueError(f"Invalid instruction format: {instruction}")
+    A, B = parts
+    return int(A), int(B)
+
+def assemble_instruction(A, B):
+    global result_data, log_file_data
+    command = bytearray(3)
+    command[0] = (A & 0x1F) << 3  # Биты 0-4 в команде
+    command[1] = (B & 0x0FFF) >> 8  # Биты 5-16 в команде
+    command[2] = B & 0xFF  # Биты 0-7 в команде
+
+    result_data.extend(command)
+
+    log_entry = ET.Element("instruction")
+    A_elem = ET.SubElement(log_entry, "A")
+    A_elem.text = str(A)
+    B_elem = ET.SubElement(log_entry, "B")
+    B_elem.text = str(B)
+    result_elem = ET.SubElement(log_entry, "result")
+    result_elem.text = " ".join(f"{byte:02X}" for byte in command)
+    log_file_data.append(log_entry)
+
+def write_log_file(log_file):
+    log_root = ET.Element("log")
+    for entry in log_file_data:
+        log_root.append(entry)
+    tree = ET.ElementTree(log_root)
+    try:
+        tree.write(log_file, encoding="utf-8", xml_declaration=True)
+    except IOError as e:
+        print(f"Error writing log file {log_file}: {e}")
+        exit(1)
+    print(f"Log written to {log_file}")
+
+def write_binary_file(output_file):
+    try:
+        with open(output_file, "wb") as file:
+            file.write(bytearray(result_data))
+    except IOError as e:
+        print(f"Error writing binary file {output_file}: {e}")
+        exit(1)
+    print(f"Binary written to {output_file}")
+
+def read_binary_file(input_file):
+    try:
+        with open(input_file, "rb") as file:
+            return file.read()
+    except FileNotFoundError:
+        print(f"Error! File {input_file} not found")
+        exit(1)
+
+def interpret_commands(binary_data, memory_range):
+    memory = [0] * 256
+    accumulator = 0
+    i = 0
+    while i < len(binary_data):
+        if i + 3 > len(binary_data):
+            break
+        command = binary_data[i:i + 3]
+        A = (command[0] >> 3) & 0x1F  # Биты 0-4 в команде
+        B = ((command[0] & 0x07) << 8) | (command[1] << 0) | command[2]  # Биты 5-16 в команде
+
+        # Определяем маску для 11-битного числа
+        MASK = 0x7FF  # 11111111111 в двоичном виде
+
+        # Преобразуем 11-битное число в знаковое число
+        B &= MASK  # Оставляем только 11 младших бит
+        if B & (1 << 10):  # Если старший бит установлен, число отрицательное
+            B -= (MASK + 1)
+
+        print(A, B)
+        if A == 4:  # Загрузка константы
+            accumulator = B & 0xFFFF  # Загружаем только 16 младших бит
+        elif A == 23:  # Чтение значения из памяти
+            address = (accumulator + B) % 1024
+            accumulator = memory[address]
+        elif A == 10:  # Запись значения в память
+            memory[B % 1024] = accumulator
+        elif A == 11:  # Унарная операция sgn()
+            address = B % 1024
+            value = memory[address]
+            if value < 0:
+                memory[accumulator % 1024] = -1
+            elif value == 0:
+                memory[accumulator % 1024] = 0
+            else:
+                memory[accumulator % 1024] = 1
+        i += 3
+
+    start, end = map(int, memory_range.split(":"))
+    if start < 0 or end > 1024 or start >= end:
+        print(f"Error! Invalid memory range: {memory_range}")
+        exit(1)
+    return memory[start:end]
+
+def write_result_file(result_file, memory_slice):
+    result_root = ET.Element("result")
+    for i, value in enumerate(memory_slice):
+        address_elem = ET.SubElement(result_root, "address")
+        address_elem.set("index", str(i))
+        address_elem.text = str(value)
+    tree = ET.ElementTree(result_root)
+    try:
+        tree.write(result_file, encoding="utf-8", xml_declaration=True)
+    except IOError as e:
+        print(f"Error writing result file {result_file}: {e}")
+        exit(1)
+    print(f"Result written to {result_file}")
+
+def main():
+    args = parse_args()
+    if args.mode == "assemble":
+        instructions = read_input_file(args.input_file)
+        for line in instructions:
+            if not line.strip():
+                continue
+            try:
+                A, B = parse_instruction(line.strip())
+                assemble_instruction(A, B)
+            except ValueError as e:
+                print(f"Error in line '{line.strip()}': {e}")
+                exit(1)
+        write_binary_file(args.output_file)
+        if args.log_file:
+            write_log_file(args.log_file)
+    elif args.mode == "interpret":
+        if not args.result_file or not args.memory_range:
+            print("Error! Result file and memory range are required for interpretation.")
+            exit(1)
+        binary_data = read_binary_file(args.input_file)
+        memory_slice = interpret_commands(binary_data, args.memory_range)
+        write_result_file(args.result_file, memory_slice)
+
+if __name__ == "__main__":
+    main()
